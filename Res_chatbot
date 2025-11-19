@@ -1,0 +1,575 @@
+!pip install fastapi uvicorn pyngrok sqlalchemy psycopg2-binary qrcode[pil] autopep8
+
+import os
+os.makedirs('app', exist_ok=True)
+os.makedirs('static', exist_ok=True)
+
+
+%%writefile app/config.py
+# Enter the details
+DATABASE_URL = ""
+UPI_ID = ""
+PAYEE_NAME = ""
+STATIC_DIR = ""
+NGROK_DOMAIN = ""
+
+
+%%writefile app/db.py
+from sqlalchemy import create_engine, insert, text
+from sqlalchemy.orm import sessionmaker, declarative_base
+from app.config import DATABASE_URL
+
+# --- Database setup ---
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+%%writefile app/models_menu.py
+from sqlalchemy import Column, Integer, String, Float
+from app.db import Base
+
+class PotluMenu(Base):
+    __tablename__ = "menu_table"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    price = Column(Float)
+
+
+%%writefile app/models_orders.py
+from sqlalchemy import Column, Integer, String, Float, Text
+from app.db import Base
+
+class PotluOrder(Base):
+    __tablename__ = "orders_table"
+    id = Column(Integer, primary_key=True, index=True)
+    menu = Column(Text, nullable=False)
+    payable = Column(Float, nullable=False)
+    payment_status = Column(String, default="pending")
+    tracking_details = Column(String, default="order received")
+
+
+%%writefile app/pydantic_models.py
+from pydantic import BaseModel
+from typing import Optional
+
+# ---------- Menu CRUD ----------
+class PotluCreate(BaseModel):
+    name: str
+    price: float
+
+class PotluUpdate(BaseModel):
+    name: str
+    price: float
+
+# ---------- Orders Update (for restaurant use) ----------
+class OrderUpdate(BaseModel):
+    payment_status: Optional[str] = None
+    tracking_details: Optional[str] = None
+
+
+%%writefile app/intents.py
+from sqlalchemy import create_engine, text
+import random, time, traceback
+from app.config import DATABASE_URL
+
+engine = create_engine(DATABASE_URL, echo=False, future=True)
+user_orders = {}  # session-wise dict: {session_id: {food_item: qty}}
+
+def handle_intent(data):
+    intent_name = data['queryResult']['intent']['displayName']
+
+    # 1️⃣ Default Welcome
+    if intent_name == "Default Welcome Intent":
+        return {"fulfillmentText": "Hey there! Welcome to Potlu Cafe 🍽️. Choose among new order, track order, or cancel order"}
+
+    # 2️⃣ New Order
+    elif intent_name == "new.order- context: ongoing-order":
+        greet_msgs = [
+            "Great!! What would you like to have? Please select items from the menu and mention quantity for each. For example: '1 Plain Dosa', '3 Vada Pav', 'Chicken Biryani 3' etc.",
+            "Awesome! You can order something like: '2 Idli', '1 Masala Dosa', or '3 Vada Pav'.",
+            "Sure! Let's start your order. You can say something like '1 Dosa', '2 Pav Bhaji', or '1 Biryani'."
+        ]
+        random_greeting = random.choice(greet_msgs)
+
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT name, price FROM menu_table ORDER BY name;"))
+                rows = result.fetchall()
+
+            if not rows:
+                raise Exception("No menu items found in database")
+
+            menu_text = "📜 *Menu:*\n" + "\n".join(
+                [f"- {name} — ₹{price:.2f}" for name, price in rows]
+            )
+
+            reply_text = f"{random_greeting}\n\n{menu_text}"
+            print(f"✅ Menu fetched successfully ({len(rows)} items).")
+
+        except Exception as e:
+            print("❌ Error fetching menu from Neon DB:", e)
+            reply_text = f"⚠️ Sorry, I couldn’t load the menu right now. ({str(e)})"
+
+        return {"fulfillmentMessages": [{"text": {"text": [reply_text]}}]}
+
+    # 3️⃣ Add to Order — context: ongoing-order
+    elif intent_name == "order.add- context: ongoing-order":
+        session_id = data["session"].split("/")[-1]  # unique user session
+        params = data.get("queryResult", {}).get("parameters", {})
+        food_items = params.get("food-items", [])
+        numbers = params.get("number", [])
+
+        if not food_items:
+            return {"fulfillmentText": "Please mention the food items you'd like to add."}
+
+        # ensure session exists
+        if session_id not in user_orders:
+            user_orders[session_id] = {}
+
+        # combine all items in this intent call
+        added_items = []
+        for i, item in enumerate(food_items):
+            qty = int(numbers[i]) if i < len(numbers) and numbers[i] else 1
+            item = str(item).lower()
+            user_orders[session_id][item] = user_orders[session_id].get(item, 0) + qty
+            added_items.append(f"{item} ({qty})")
+
+        added_summary = ", ".join(added_items)
+        order_snapshot = ", ".join([f"{k} x{v}" for k, v in user_orders[session_id].items()])
+
+        msg = (
+            f"✅ Added {added_summary} to your order.\n\n"
+            f"🧾 Current order: {order_snapshot}\n"
+            "You can continue adding more or say 'done' when finished."
+        )
+
+        print(f"🧠 Session {session_id} — updated order:", user_orders[session_id])
+
+        return {"fulfillmentMessages": [{"text": {"text": [msg]}}]}
+
+     # 4️⃣ Remove from Order — context: ongoing-order
+    elif intent_name == "remove.order- context: ongoing-order":
+        session_id = data["session"].split("/")[-1]
+        params = data.get("queryResult", {}).get("parameters", {})
+        food_items = params.get("food-items", [])
+        numbers = params.get("number", [])
+
+        # Check if user even has an order started
+        if session_id not in user_orders or not user_orders[session_id]:
+            return {"fulfillmentText": "You don’t have any items in your order yet to remove."}
+
+        if not food_items:
+            return {"fulfillmentText": "Please mention which item you'd like to remove."}
+
+        removed_items = []
+        for i, item in enumerate(food_items):
+            qty_to_remove = int(numbers[i]) if i < len(numbers) and numbers[i] else 1
+            item = str(item).lower()
+
+            if item not in user_orders[session_id]:
+                removed_items.append(f"{item} (not in order)")
+                continue
+
+            # Decrease quantity or remove item
+            user_orders[session_id][item] -= qty_to_remove
+            if user_orders[session_id][item] <= 0:
+                del user_orders[session_id][item]
+                removed_items.append(f"{item} (removed completely)")
+            else:
+                removed_items.append(f"{item} (-{qty_to_remove})")
+
+        # Prepare message summary
+        if user_orders[session_id]:
+            updated_summary = ", ".join([f"{k} x{v}" for k, v in user_orders[session_id].items()])
+            msg = (
+                f"🗑️ Removed: {', '.join(removed_items)}.\n\n"
+                f"🧾 Updated order: {updated_summary}\n"
+                "You can add or remove more items, or say 'done' when finished."
+            )
+        else:
+            msg = f"🗑️ Removed: {', '.join(removed_items)}.\n\nYour order is now empty."
+
+        print(f"🧾 Session {session_id} — updated order after removal:", user_orders[session_id])
+
+        return {"fulfillmentMessages": [{"text": {"text": [msg]}}]}
+
+
+
+
+
+    # 5️⃣ Complete Order — context: ongoing-order
+    elif intent_name == "complete.order- context:ongoing-order":
+        session_id = data["session"].split("/")[-1]
+
+        # Validate session order
+        if session_id not in user_orders or not user_orders[session_id]:
+            return {"fulfillmentText": "Your order is empty. Please add some items first."}
+
+        # Fetch prices from Neon
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT name, price FROM menu_table;"))
+                rows = result.fetchall()
+            price_map = {name.lower(): price for name, price in rows}
+        except Exception as e:
+            print("❌ Price fetch failed:", e)
+            return {"fulfillmentText": "⚠️ Could not fetch menu prices. Try again."}
+
+        order_dict = user_orders[session_id]
+        bill_lines, total = [], 0
+
+        for item, qty in order_dict.items():
+            price = price_map.get(item)
+            if price is None:
+                bill_lines.append(f"- {item} x{qty} — ❌ price missing")
+            else:
+                subtotal = price * qty
+                total += subtotal
+                bill_lines.append(f"- {item} x{qty} — ₹{subtotal:.2f}")
+
+        bill_text = "\n".join(bill_lines)
+
+        # --- UPI payment details ---
+        upi_id = "moumita.mitra.it@okhdfcbank"
+        payee = "Potlu Cafe"
+        upi_url = (
+            f"upi://pay?pa={upi_id}"
+            f"&pn={payee}"
+            f"&am={total:.2f}"
+            f"&cu=INR"
+        )
+
+        # Both QR + clickable link
+        qr_image_url = (
+            f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={upi_url}"
+        )
+
+        clickable_link = (
+            f"📲 *Tap to Pay:* {upi_url}\n"
+            f"(Opens Google Pay / PhonePe / Paytm)"
+        )
+
+        # --- Save order to DB ---
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO orders_table (menu, payable, payment_status, tracking_details)
+                    VALUES (:menu, :payable, 'pending', 'order received')
+                """), {
+                    "menu": str(order_dict),
+                    "payable": total
+                })
+            print("✅ Order saved to DB")
+        except Exception as e:
+            print("❌ DB insert error:", e)
+
+        # --- Build response BEFORE clearing ---
+        final_bill = (
+            f"🧾 *Your Final Bill:*\n{bill_text}\n\n"
+            f"💰 *Total Payable:* ₹{total:.2f}\n\n"
+            f"{clickable_link}\n\n"
+            "Or scan the QR code above to pay.\n"
+            "❤️ Thank you for ordering from Potlu Cafe!"
+        )
+
+        # --- Clear user order after confirming ---
+        user_orders[session_id] = {}
+
+        # --- Return combined payload ---
+        return {
+            "fulfillmentMessages": [
+                {
+                    "payload": {
+                        "richContent": [
+                            [
+                                {
+                                    "type": "image",
+                                    "rawUrl": qr_image_url,
+                                    "accessibilityText": "Payment QR"
+                                }
+                            ]
+                        ]
+                    }
+                },
+                {
+                    "text": {"text": [final_bill]}
+                }
+            ]
+        }
+
+    # 6️⃣ Track Order — context: tracking-order
+    elif intent_name == "track.order- context: tracking-order":
+        # Dialogflow will ask user for the order number next
+        return {}
+
+    # 7️⃣ TrackING Order — context: tracking order
+    elif intent_name == "trackING.order-context: tracking order":
+        params = data.get("queryResult", {}).get("parameters", {})
+        order_id = params.get("number")
+
+        if not order_id:
+            return {"fulfillmentText": "Please provide a valid order number."}
+
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT payment_status, tracking_details "
+                        "FROM orders_table WHERE id = :id"
+                    ),
+                    {"id": order_id},
+                ).fetchone()
+
+            if not result:
+                return {
+                    "fulfillmentText": f"❌ No order found with ID #{order_id}. Please check the number."
+                }
+
+            payment_status, tracking_details = result
+            msg = (
+                f"📦 *Order ID #{order_id}*\n"
+                f"💰 *Payment Status:* {payment_status}\n"
+                f"🚚 *Order Tracking:* {tracking_details}"
+            )
+            print(f"✅ Tracking info fetched for order #{order_id}")
+
+        except Exception as e:
+            print("❌ Tracking query failed:", e)
+            msg = "⚠️ I couldn't retrieve tracking details right now. Please try again later."
+
+        return {"fulfillmentMessages": [{"text": {"text": [msg]}}]}
+
+    # 9️⃣ Cancel Order — context: cancelling-order
+    elif intent_name == "cancel.order-context:cancelling-order":
+        # This intent is mostly handled by Dialogflow itself (asking for confirmation or ID)
+        print("🟡 Cancel order intent detected — awaiting user confirmation or ID.")
+        return {
+            "fulfillmentText": (
+                "Alright, I can help you cancel your order. "
+                "Please share your order number so I can process the cancellation. 🔢"
+            )
+        }
+
+    # 🔟 Cancelling Order — context: cancelling-order
+    elif intent_name == "cancelling.order-context:cancelling-order":
+        params = data.get("queryResult", {}).get("parameters", {})
+        order_id = params.get("number")
+
+        if not order_id:
+            return {"fulfillmentText": "Please provide a valid order number to cancel."}
+
+        try:
+            with engine.connect() as conn:
+                # Fetch current status
+                result = conn.execute(
+                    text(
+                        "SELECT payment_status, tracking_details "
+                        "FROM orders_table WHERE id = :id"
+                    ),
+                    {"id": order_id},
+                ).fetchone()
+
+                if not result:
+                    return {
+                        "fulfillmentText": f"❌ No order found with ID #{order_id}. Please check and try again."
+                    }
+
+                payment_status, tracking_details = result
+
+                # Check if order already delivered
+                if tracking_details.lower() == "delivered":
+                    msg = (
+                        f"🚫 Order #{order_id} has already been *delivered* and cannot be canceled."
+                    )
+                else:
+                    # Update status in DB
+                    conn.execute(
+                        text(
+                            "UPDATE orders_table "
+                            "SET tracking_details = 'order canceled', "
+                            "payment_status = 'refund initiated' "
+                            "WHERE id = :id"
+                        ),
+                        {"id": order_id},
+                    )
+                    msg = (
+                        f"✅ Order #{order_id} has been *canceled* successfully. "
+                        f"Refund has been initiated to your original payment method."
+                    )
+                    print(f"🛑 Order #{order_id} canceled successfully.")
+
+        except Exception as e:
+            print("❌ Error canceling order:", e)
+            msg = (
+                "⚠️ Something went wrong while canceling your order. "
+                "Please try again in a few moments."
+            )
+
+        return {"fulfillmentMessages": [{"text": {"text": [msg]}}]}
+
+
+
+    # Fallback
+    else:
+        return {"fulfillmentText": "Sorry, I didn’t quite get that."}
+
+
+%%writefile app/routes_crud.py
+from fastapi import APIRouter, HTTPException
+from sqlalchemy.orm import Session
+from app.db import SessionLocal
+from app.models_menu import PotluMenu
+from app.models_orders import PotluOrder
+from app.pydantic_models import PotluCreate, PotluUpdate, OrderUpdate
+
+router = APIRouter()
+
+# ---------- MENU CRUD ROUTES ----------
+
+@router.get("/food_items/")
+def get_all_menu_items():
+    db: Session = SessionLocal()
+    items = db.query(PotluMenu).all()
+    db.close()
+    return items
+
+
+@router.get("/food_items/{item_id}")
+def get_menu_item(item_id: int):
+    db: Session = SessionLocal()
+    item = db.query(PotluMenu).filter(PotluMenu.id == item_id).first()
+    db.close()
+    if not item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+    return item
+
+
+@router.post("/food_items/")
+def create_menu_item(new_item: PotluCreate):
+    db: Session = SessionLocal()
+    entry = PotluMenu(name=new_item.name, price=new_item.price)
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    db.close()
+    return {"message": "Menu item added successfully", "entry": entry}
+
+
+@router.put("/food_items/{item_id}")
+def update_menu_item(item_id: int, update_data: PotluUpdate):
+    db: Session = SessionLocal()
+    item = db.query(PotluMenu).filter(PotluMenu.id == item_id).first()
+    if not item:
+        db.close()
+        raise HTTPException(status_code=404, detail="Menu item not found")
+
+    item.name = update_data.name
+    item.price = update_data.price
+    db.commit()
+    db.refresh(item)
+    db.close()
+    return {"message": "Menu item updated successfully", "entry": item}
+
+
+@router.delete("/food_items/{item_id}")
+def delete_menu_item(item_id: int):
+    db: Session = SessionLocal()
+    item = db.query(PotluMenu).filter(PotluMenu.id == item_id).first()
+    if not item:
+        db.close()
+        raise HTTPException(status_code=404, detail="Menu item not found")
+
+    db.delete(item)
+    db.commit()
+    db.close()
+    return {"message": f"Menu item with id={item_id} deleted successfully"}
+
+
+# ---------- ORDERS READ ROUTE ----------
+
+@router.get("/orders/")
+def get_all_orders():
+    db: Session = SessionLocal()
+    entries = db.query(PotluOrder).all()
+    db.close()
+    return [
+        {
+            "id": e.id,
+            "menu": e.menu,
+            "payable": e.payable,
+            "payment_status": e.payment_status,
+            "tracking_details": e.tracking_details,
+        }
+        for e in entries
+    ]
+
+
+%%writefile app/main.py
+from fastapi import FastAPI, Request
+from app.db import Base, engine
+from app.models_menu import PotluMenu
+from app.models_orders import PotluOrder
+from app.intents import handle_intent
+from app.routes_crud import router as crud_router
+
+# ✅ Create tables if not present
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+
+# Include CRUD routes under /api
+app.include_router(crud_router, prefix="/api", tags=["CRUD"])
+
+@app.get("/")
+def root():
+    return {"message": "✅ Potlu Cafe API is running successfully!"}
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    response = handle_intent(data)
+    return response
+
+
+from sqlalchemy import create_engine, text
+from app.config import DATABASE_URL
+
+engine = create_engine(DATABASE_URL, echo=False)
+
+try:
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT name, price FROM menu_table ORDER BY name;"))
+        rows = result.fetchall()
+        print("✅ Connected successfully!")
+        print("Menu items:")
+        for name, price in rows:
+            print(f"- {name} — ₹{price}")
+except Exception as e:
+    print("❌ Connection failed:", e)
+
+
+!pkill -f ngrok
+!pkill -f uvicorn
+
+!ngrok config add-authtoken 32rcZgoj0hmItAQ7BLETRNIGSHq_68B2UvNZqqQusD3feMgmN
+
+# Kill old ngrok processes
+!kill $(ps aux | grep 'ngrok' | awk '{print $2}') > /dev/null 2>&1
+
+from pyngrok import ngrok
+import threading, uvicorn, time
+
+# Stop existing tunnels and restart fresh
+ngrok.kill()
+
+public_url = ngrok.connect(8000, domain="loungy-marylee-dashy.ngrok-free.dev")
+print("Public URL:", public_url)
+
+def run():
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
+
+thread = threading.Thread(target=run, daemon=True)
+thread.start()
+time.sleep(5)
+
+print("✅ FastAPI is running and Ngrok tunnel is ready.")
